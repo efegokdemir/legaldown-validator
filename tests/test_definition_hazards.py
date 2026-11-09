@@ -688,6 +688,22 @@ def test_no_definition_is_read_at_a_label_that_is_dead_whatever_completes_it():
     assert holes == 0
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        "[Option A]: The Seller shall pay {{placeholder: p1}} to {{placeholder: p2}} at {{placeholder: p3}}.\n[b]: https://x",
+        "[Option A]: The Seller shall pay {{placeholder: p1}} to {{placeholder: p2}} at {{placeholder: p3}}.\n[Option B]: {{placeholder: p4}} shall pay.",
+    ],
+)
+def test_cutoff_lemma_ignores_label_shaped_paragraph_continuations(body):
+    """A continuation line cannot open a definition, even when its first character is ``[``."""
+    assembled = re.sub(r"\{\{placeholder: p[1-5]}}", "\x01", body)
+    lines = assembled.splitlines()
+    assert hazards._all_dead(lines)
+    assert definitions_read(assembled)[0] == ()
+    assert all(_read_definition(assembled, 0, reading) is None for reading in (Reading.SPEC, Reading.MDIT, Reading.PANDOC))
+
+
 def test_the_generators_reach_what_they_are_for():
     """The shapes that the oracles are about occur in the generated templates."""
     rng = random.Random(1295)
@@ -895,7 +911,6 @@ def test_two_text_blanks_alone_and_with_a_condition_or_a_choice_are_judged_not_o
         ("[Option A]: {{placeholder: p1}} shall pay {{placeholder: p2}} to {{placeholder: p3}}.\n", 3),
         ("[Option A]: Pay {{placeholder: p1}} to {{placeholder: p2}} at {{placeholder: p3}}.\n", 3),
         ("[Option A]: (The) Seller shall pay {{placeholder: p1}} to {{placeholder: p2}} at {{placeholder: p3}}.\n", 3),
-        ("[Effective Date]: {{placeholder: d1}} is the date {{placeholder: p1}} and {{placeholder: p2}} and {{placeholder: p3}}.\n", 4),
         ("[Option\nA]: The Seller shall pay {{placeholder: p1}} to {{placeholder: p2}} at {{placeholder: p3}}.\n", 3),
         ("[a]: u{{placeholder: p1}} x {{placeholder: p2}} {{placeholder: p3}}\n", 3),
         ("[a]: u {{placeholder: p1}} {{placeholder: p2}} {{placeholder: p3}}\n", 3),
@@ -943,6 +958,26 @@ _CHOICE_2 = '{{choose: c2, true="30", false="60"}}'
 def test_three_text_blanks_after_a_destination_word_and_a_word_are_judged_clean_by_the_cutoff(body):
     found = reported(body)
     assert found == [], found
+
+
+def test_typed_placeholder_does_not_block_the_dead_label_cutoff():
+    body = "[Effective Date]: {{placeholder: d1}} is the date {{placeholder: p1}} and {{placeholder: p2}} and {{placeholder: p3}}.\n"
+    assert reported(body) == []
+
+    body = "[a]: u {{placeholder: d1}} {{placeholder: p1}} {{placeholder: p2}} {{placeholder: p3}}\n"
+    assert hazards._hopeless("[a]: u {{placeholder: d1}}", {"d1"}) is False
+    assert hazards._hopeless("[a]: u {{placeholder: p1}}", {"d1"}) is True
+    assert reported(body) == []
+
+
+def test_same_region_shape_in_the_preamble_and_a_section_has_distinct_memo_entries():
+    paragraph = "[Option A]: The Seller shall pay {{placeholder: p1}} to {{placeholder: p2}} at {{placeholder: p3}}."
+    body = f"{paragraph}\n\n# A\n\n{paragraph}\n"
+    document = parse(_HEAD + body)
+    lines = Locator(document).body()[0]
+    assembler = hazards._Assembler(document, "\n".join(lines) + "\n", True)
+    assembler.hazards()
+    assert len(assembler.memo) == 2
 
 
 def test_fifty_option_paragraphs_of_three_blanks_are_clean_in_one_assembly_each(monkeypatch):

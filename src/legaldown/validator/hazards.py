@@ -41,7 +41,7 @@ from ..directives import Directive, lex
 from ..markdown import is_blank, is_drafting_marker, label_end, skip_blanks
 from ..markers import MARKER_RE
 from ..models import Document
-from ..parser import parse
+from ..parser import _layout, _read_quote, parse
 from ..positions import Locator
 from .patterns import IDENTIFIER_RE, VALID_PLACEHOLDER_TYPES
 from .result import _Recorder
@@ -616,9 +616,17 @@ class _Assembler:
             decisions *= len(values)
         cost = decisions * weight + fixed
         too_many = len(TEXT_WITNESSES) ** len(texts) > CAP  # (over the cap whatever the places)
+        typed_placeholders = {
+            occ.qid
+            for occ in insertions
+            if occ.directive.name == "placeholder"
+            and (asked := self._question(occ)) is not None
+            and asked[0].get("type") != "text"
+        }
         cutoff = (
             bool(texts) and decisions <= DECISION_CAP and cost <= WORK_CAP
-            and SENTINEL not in "".join([*context, *lines]) and not any(map(_hopeless, lines))
+            and SENTINEL not in "".join([*context, *lines])
+            and not any(_hopeless(line, typed_placeholders) for line in lines)
         )
         if too_many and not cutoff:
             return everything, True
@@ -628,8 +636,10 @@ class _Assembler:
         size = 1
         for values in keys.values():
             size *= len(values)
+        under_heading = bool(self.source.headings) and self.source.headings[0] <= start and start not in self.heading_starts
         shape = (
-            tuple(lines), tuple(context), tuple(names), tuple((name, repr(each)) for name, each in declared.items()),
+            under_heading, tuple(lines), tuple(context), tuple(names),
+            tuple((name, repr(each)) for name, each in declared.items()),
             tuple((name, tuple(keys[name])) for name in texts),
         )
 
@@ -970,18 +980,22 @@ def _dead(line: str, at: int) -> bool:
     return k < len(rest) and rest[k] not in "\"'("
 
 
-def _hopeless(line: str) -> bool:
+def _hopeless(line: str, typed_placeholders: set[str] | frozenset[str] = frozenset()) -> bool:
     """Whether the *line* of the template, if a label begins it, is certainly no dead label (``_dead``) in any
     output, from its text up to its first ``{{`` alone: the cutoff is not tried for a region that holds one. It
     only decides whether to try, never that a region is clean. What follows that text is unknown, unless it is
-    nothing (the line's end) or a ``{{placeholder:}}`` (an answer, or a typed value: both end what ``_dead``
-    reads), and a marker ``{when=}`` at the end of the line is not in the output."""
+    nothing (the line's end) or a typed placeholder (whose fixed value ends what ``_dead`` reads); an untyped
+    placeholder can supply a title opener and keeps the line live. A marker ``{when=}`` at the end of the line is
+    not in the output."""
     found = _LABEL_START_RE.match(line)
     if found is None or "{when=" in line or "{#" in line:
         return False
     cut = line.find("{{")
     head = line if cut < 0 else line[:cut]
-    ends = cut < 0 or line.startswith("{{placeholder:", cut)  # (nothing more than the head is read)
+    directive = next((each for each in lex(line).directives if each.start == cut), None) if cut >= 0 else None
+    ends = cut < 0 or (
+        directive is not None and directive.name == "placeholder" and directive.positional not in typed_placeholders
+    )
     close = label_end(head, found.end() - 1)
     if close is None:
         return cut < 0  # (an answer may be in the label, and close it)
@@ -1003,13 +1017,49 @@ def _hopeless(line: str) -> bool:
 
 
 def _all_dead(lines: list[str]) -> bool:
-    """Whether every label that opens a line of the assembled *lines* is dead (``_dead``): a candidate is each
-    ``[`` that a definition could begin with, which is more than the definitions there are."""
-    for line in lines:
-        found = _LABEL_START_RE.match(line)
-        if found is not None and not _dead(line, found.end() - 1):
-            return False
-    return True
+    """Whether every paragraph-opening label in the assembled *lines* is dead (``_dead``).
+
+    A line that continues a paragraph cannot open a link definition, even when it starts with ``[``. Parse the
+    assembled block structure first so continuation lines do not force the conservative fallback.
+    """
+    def paragraphs_are_dead(source_lines: list[str], containers: list[list]) -> bool:
+        for spans in containers:
+            previous = None
+            for span in spans:
+                if span.kind in ("paragraph", "link_definition"):
+                    # Text after a definition peeled from this paragraph is still a continuation, not a new
+                    # paragraph that can open another definition.
+                    continued = (
+                        span.kind == "paragraph"
+                        and previous is not None
+                        and previous.kind == "link_definition"
+                        and span.start == previous.end
+                    )
+                    line = source_lines[span.start]
+                    line = _typed_values_as_text(line)
+                    found = _LABEL_START_RE.match(line) if not continued else None
+                    if found is not None and not _dead(line, found.end() - 1):
+                        return False
+                if span.kind in ("ordered_list", "unordered_list"):
+                    if any(not paragraphs_are_dead(source_lines, [item.blocks]) for item in span.items):
+                        return False
+                elif span.kind == "quote":
+                    _end, quoted, _open_paragraph = _read_quote(source_lines, span.start)
+                    if not paragraphs_are_dead(quoted, _layout(quoted).containers()):
+                        return False
+                previous = span
+        return True
+
+    return paragraphs_are_dead(lines, _layout(lines).containers())
+
+
+def _typed_values_as_text(line: str) -> str:
+    """Treat filled typed-placeholder directives as their fixed plain-text value when proving a label dead."""
+    directives = lex(line).directives
+    for directive in reversed(directives):
+        if directive.name in ("date", "money", "duration") and not directive.malformed:
+            line = line[:directive.start] + "typed-value" + line[directive.end:]
+    return line
 
 
 def _definitions(output: str) -> tuple[tuple[str, str, str], ...]:
